@@ -1,0 +1,260 @@
+#cloud-config
+package_update: true
+package_upgrade: false
+
+# Preserve user access and password authentication
+users:
+  - name: ubuntu
+    groups: [adm, sudo, audio, cdrom, dialout, dip, floppy, lxd, netdev, plugdev, video]
+    lock_passwd: false
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+
+ssh_pwauth: true
+ssh_deletekeys: false
+ssh_genkeytypes: []
+
+system_info:
+  default_user:
+    name: ubuntu
+
+write_files:
+  # Environment variables file - NO 'export' keyword (systemd EnvironmentFile format)
+  - path: /home/ubuntu/.coder_env
+    owner: ubuntu:ubuntu
+    permissions: '0644'
+    content: |
+      CODER_AGENT_URL="${coder_agent_url}"
+
+  # Source the env file in bashrc - with export for shell use
+  - path: /home/ubuntu/.bashrc_coder
+    owner: ubuntu:ubuntu
+    permissions: '0644'
+    content: |
+      # Source Coder environment variables and export them
+      if [ -f ~/.coder_env ]; then
+        set -a
+        . ~/.coder_env
+        set +a
+      fi
+
+  # Install Coder agent script
+  - path: /home/ubuntu/install-coder.sh
+    owner: ubuntu:ubuntu
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      set -e
+      
+      # Use a simple log file name without variable expansion
+      LOG_FILE=/home/ubuntu/coder-install.log
+      exec > >(tee -a $LOG_FILE) 2>&1
+      
+      echo "=== Coder Agent Installation Started at $(date) ==="
+      
+      # Source environment variables FIRST - use set -a to auto-export
+      if [ -f ~/.coder_env ]; then
+        set -a
+        . ~/.coder_env
+        set +a
+      fi
+      
+      export HOME=/home/ubuntu
+      export PATH=/usr/bin:/bin:/usr/sbin:/sbin:/home/ubuntu/code-server/bin:/home/ubuntu/bin:$PATH
+      
+      /bin/mkdir -p /home/ubuntu/bin
+      /bin/mkdir -p /home/ubuntu/code-server
+      
+      # Install code-server
+      if [ ! -f /home/ubuntu/code-server/bin/code-server ]; then
+        echo "Installing code-server..."
+        HOME=/home/ubuntu /usr/bin/curl -fsSL https://code-server.dev/install.sh | HOME=/home/ubuntu /bin/sh -s -- --method=standalone --prefix=/home/ubuntu/code-server
+      fi
+      
+      # Start code-server
+      if ! pgrep -f "code-server.*13337" > /dev/null 2>&1; then
+        /home/ubuntu/code-server/bin/code-server --auth none --port 13337 >/home/ubuntu/code-server.log 2>&1 &
+        sleep 2
+      fi
+      
+      # Download Coder agent binary
+      cd /home/ubuntu/bin
+      if [ ! -f /home/ubuntu/bin/coder ]; then
+        echo "Downloading Coder agent..."
+        
+        # Verify environment variable is set
+        if [ -z "$CODER_AGENT_URL" ]; then
+          echo "ERROR: CODER_AGENT_URL not set in environment"
+          echo "Checking .coder_env file:"
+          cat ~/.coder_env || true
+          exit 1
+        fi
+        
+        echo "CODER_AGENT_URL from environment: $CODER_AGENT_URL"
+        
+        # Remove trailing slash if present using sed (avoid Terraform parsing issues)
+        CODER_URL_CLEAN=$(echo "$CODER_AGENT_URL" | sed 's|/*$||')
+        DOWNLOAD_URL="$CODER_URL_CLEAN/bin/coder-linux-amd64"
+        
+        echo "Download URL: $DOWNLOAD_URL"
+        
+        # Try downloading from Coder server
+        if /usr/bin/curl -fsSL "$DOWNLOAD_URL" -o coder; then
+          echo "Downloaded from Coder server successfully"
+          /bin/chmod +x coder
+          
+          # Verify the download
+          if [ -f coder ] && [ -x coder ]; then
+            # Test the binary
+            if ./coder --version > /dev/null 2>&1; then
+              echo "Coder agent downloaded and verified successfully"
+              ./coder --version
+            else
+              echo "ERROR: Coder binary is not executable or corrupted"
+              exit 1
+            fi
+          else
+            echo "ERROR: Failed to make coder executable"
+            exit 1
+          fi
+        else
+          CURL_EXIT=$?
+          echo "Failed to download from Coder server (exit code: $CURL_EXIT)"
+          echo "Tried URL: $DOWNLOAD_URL"
+          echo "Falling back to GitHub..."
+          
+          # Fallback to GitHub
+          GITHUB_URL="https://github.com/coder/coder/releases/latest/download/coder_linux_amd64.tar.gz"
+          echo "GitHub URL: $GITHUB_URL"
+          
+          if /usr/bin/curl -fsSL "$GITHUB_URL" -o /tmp/coder.tar.gz; then
+            echo "Downloaded tar.gz from GitHub"
+            if /bin/tar -xzf /tmp/coder.tar.gz -C /tmp; then
+              if [ -f /tmp/coder ]; then
+                /bin/mv /tmp/coder coder
+                /bin/chmod +x coder
+                echo "Extracted coder binary from GitHub successfully"
+                
+                # Verify
+                if ./coder --version > /dev/null 2>&1; then
+                  echo "Coder agent downloaded and verified successfully"
+                  ./coder --version
+                else
+                  echo "ERROR: Coder binary from GitHub is not executable or corrupted"
+                  exit 1
+                fi
+              else
+                echo "ERROR: coder binary not found in tar.gz"
+                exit 1
+              fi
+            else
+              echo "ERROR: Failed to extract tar.gz"
+              exit 1
+            fi
+            /bin/rm -f /tmp/coder.tar.gz
+          else
+            echo "ERROR: Failed to download from both Coder server and GitHub"
+            exit 1
+          fi
+        fi
+      fi
+      
+      # Get token from Terraform variable
+      CODER_TOKEN="${coder_agent_token}"
+      
+      echo "Coder URL: $CODER_AGENT_URL"
+      echo "Coder Token length: $(echo -n "$CODER_TOKEN" | wc -c)"
+      
+      # Validate
+      if [ -z "$CODER_AGENT_URL" ]; then
+        echo "ERROR: CODER_AGENT_URL not set"
+        exit 1
+      fi
+      
+      # Check if token is empty
+      if [ -z "$CODER_TOKEN" ]; then
+        echo "ERROR: CODER_TOKEN is empty"
+        exit 1
+      fi
+      
+      # Check if token looks like it wasn't expanded by Terraform (contains template variable syntax)
+      if echo "$CODER_TOKEN" | grep -q "coder_agent_token"; then
+        echo "ERROR: CODER_TOKEN appears to not have been expanded by Terraform"
+        exit 1
+      fi
+      
+      # Create systemd service
+      if [ ! -f /etc/systemd/system/coder-agent.service ]; then
+        sudo /bin/tee /etc/systemd/system/coder-agent.service > /dev/null <<SERVICE_EOF
+      [Unit]
+      Description=Coder Agent
+      After=network-online.target
+      Wants=network-online.target
+      
+      [Service]
+      Type=simple
+      User=ubuntu
+      Group=ubuntu
+      WorkingDirectory=/home/ubuntu
+      EnvironmentFile=/home/ubuntu/.coder_env
+      Environment="CODER_AGENT_TOKEN=${coder_agent_token}"
+      Environment="CODER_AGENT_AUTH=token"
+      ExecStart=/home/ubuntu/bin/coder agent
+      Restart=always
+      RestartSec=10
+      StandardOutput=journal
+      StandardError=journal
+      
+      [Install]
+      WantedBy=multi-user.target
+      SERVICE_EOF
+        
+        sudo /bin/systemctl daemon-reload
+        sudo /bin/systemctl enable coder-agent.service
+      fi
+      
+      # Start service
+      sudo /bin/systemctl start coder-agent.service || sudo /bin/systemctl restart coder-agent.service
+      
+      # Create marker file
+      touch /home/ubuntu/.coder-installed
+      
+      echo "=== Installation completed at $(date) ==="
+
+  - path: /etc/systemd/system/install-coder.service
+    owner: root:root
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Install Coder Agent
+      After=network-online.target
+      Wants=network-online.target
+      ConditionPathExists=!/home/ubuntu/.coder-installed
+      
+      [Service]
+      Type=oneshot
+      User=ubuntu
+      Group=ubuntu
+      Environment="HOME=/home/ubuntu"
+      WorkingDirectory=/home/ubuntu
+      ExecStartPre=/bin/bash -c 'while [ ! -f /home/ubuntu/install-coder.sh ] || [ ! -x /home/ubuntu/install-coder.sh ]; do sleep 1; done'
+      ExecStart=/usr/bin/bash /home/ubuntu/install-coder.sh
+      RemainAfterExit=yes
+      StandardOutput=journal
+      StandardError=journal
+      TimeoutStartSec=300
+      
+      [Install]
+      WantedBy=multi-user.target
+
+bootcmd:
+  - mkdir -p /home/ubuntu
+  - chown ubuntu:ubuntu /home/ubuntu
+  - chmod 755 /home/ubuntu
+
+runcmd:
+  # Add source command to bashrc for environment variables
+  - echo "source ~/.bashrc_coder" >> /home/ubuntu/.bashrc || true
+  - systemctl daemon-reload
+  - systemctl enable install-coder.service
+  - systemctl start install-coder.service
